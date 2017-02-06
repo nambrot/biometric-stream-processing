@@ -14,7 +14,7 @@ import scala.collection.mutable
   */
 
 object BiometricAlertStreamProcessor extends App {
-  def toEvent[T: Manifest] = (string: String) => {
+  def toEvent[T: Manifest](string: String) = {
     val objectMapper = new ObjectMapper with ScalaObjectMapper
     objectMapper.setPropertyNamingStrategy(PropertyNamingStrategy.SNAKE_CASE)
     objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
