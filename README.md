@@ -372,3 +372,100 @@ filteredEvents
 ```
 
 While it is clear that Kafka Streams is quite young, I think it has great a great foundation, and with recent additions like queryable state stores and Kafka's general versatility, I am quite excited to see where Kafka Streams will go. Articles like [this](http://why-not-learn-something.blogspot.ch/2016/12/why-and-when-distributed-stream.html?spref=tw) especially resonate with me when it comes to streaming being a potential game changer to general application development, and Kafka seems well-poised to be a major player.
+
+# Biometric Alert Streaming with Apache Beam
+
+Apache Beam is a project coming from Google and their work on their unified batch/stream processing service Dataflow. While it is clear that support for Dataflow is a priority for Google, Beam is meant to be a a framework to describe your processing work which you can then run on different backends, or what they call runners. Depending on the runner and their semantics, not all features of Beam might be supported. Checkout their [capability matrix](https://beam.apache.org/documentation/runners/capability-matrix/).
+
+```java
+// Create the pipeline
+PipelineOptions options = PipelineOptionsFactory.create();
+Pipeline p = Pipeline.create(options);
+
+// set up the events
+ArrayList<String> bloodPressureRawEvents = new ArrayList<>();
+bloodPressureRawEvents.add("{\"user_id\":12345,\"systolic\":90,\"diastolic\":80,\"timestamp\":\"2017-04-05T16:18:52-04:00\"}");
+//...
+
+ArrayList<String> heartRateRawEvents = new ArrayList<>();
+heartRateRawEvents.add("{\"user_id\":12345,\"heart_rate\":201,\"timestamp\":\"2017-04-05T16:24:52-04:00\"}");
+//...
+```
+
+After the basic setup, we can create our sources:
+
+```java
+SlidingWindows window = SlidingWindows.of(Duration.standardMinutes(60)).every(Duration.standardMinutes(5));
+
+// create the sources and map them into POJOs (and window them by the sliding window)
+PCollection<KV<Integer, BloodPressureEvent>> bpEvents =
+        p.apply(Create.of(bloodPressureRawEvents))
+            .apply(ParDo.of(new BloodPressureEventCaster()))
+            .apply(Window.into(window))
+            .apply(MapElements.via((BloodPressureEvent event) -> KV.of(event.userId, event)).withOutputType(new TypeDescriptor<KV<Integer, BloodPressureEvent>>() {}));
+PCollection<KV<Integer, HeartRateEvent>> hrEvents =
+        p.apply(Create.of(heartRateRawEvents))
+            .apply(ParDo.of(new HeartRateEventCaster()))
+            .apply(Window.into(window))
+            .apply(MapElements.via((HeartRateEvent event) -> KV.of(event.userId, event)).withOutputType(new TypeDescriptor<KV<Integer, HeartRateEvent>>() {}));
+```
+
+`PCollection` is Beam unifying abstraction that represents a collection of events. If you are in batch mode, you have a bounded collection and can use a single global window, but for streaming use cases, you will want to apply a window. Beam has a very interesting concept of windows thatI don't get into here, but would allow us to account for "late" data (when a users phone is offline etc.).
+
+```java
+final TupleTag<BloodPressureEvent> bpTag = new TupleTag<>();
+final TupleTag<HeartRateEvent> hrTag = new TupleTag<>();
+PCollection<KV<Integer, CoGbkResult>> joined =
+        KeyedPCollectionTuple.of(bpTag, bpEvents)
+                .and(hrTag, hrEvents)
+                .apply(CoGroupByKey.create());
+```
+
+Joining seems quite awkward with the use of `CoGroupByKey` and `TupleTag` which we can then filter by the following:
+
+```java
+PCollection<Alert> alerts = joined.apply(FlatMapElements.via((KV<Integer, CoGbkResult> pair) -> {
+CoGbkResult result = pair.getValue();
+Boolean hasLowSystolic = FluentIterable.from(result.getAll(bpTag)).anyMatch((BloodPressureEvent event) -> event.systolic < 100);
+Boolean hasHighHeartRate = FluentIterable.from(result.getAll(hrTag)).anyMatch((HeartRateEvent event) -> event.heartRate > 200);
+if (hasLowSystolic && hasHighHeartRate) {
+    Instant time = FluentIterable.from(result.getAll(bpTag)).first().get().timestamp;
+    Alert alert = new Alert();
+    alert.timestamp = time;
+    alert.userId = pair.getKey();
+    alert.message = "High alert detected";
+    return Lists.newArrayList(alert);
+}
+return Lists.newArrayList();
+}).withOutputType(new TypeDescriptor<Alert>() {}));
+```
+
+Like in the above cases, we'll need a way to effectively throttle the alerts since we trigger them based upon sliding windows. Since I had to resort to stateful stream processing in the other frameworks, I thought I had to do same with Beam. I waited until the [Feb 2017 announcement of stateful stream processing](https://beam.apache.org/blog/2017/02/13/stateful-processing.html) in the Beam model to do this example, but then realized that it seems Beam's statesful processing is currently restricted to processing within a window and key. Similar as side inputs. The [data driven trigger proposal](https://issues.apache.org/jira/browse/BEAM-101) might fix that in the future.
+
+However, what I effectively want is to group close Alerts together as they "belong" together, and `SessionWindow` accomplishes just that.
+
+```java
+PCollection<KV<Integer, Iterable<Alert>>> sessionedAlerts = alerts
+        .apply(Window.remerge())
+        .apply(Window.into(Sessions.withGapDuration(Duration.standardHours(1))))
+        .apply(MapElements.via((Alert event) -> KV.of(event.userId, event)).withOutputType(new TypeDescriptor<KV<Integer, Alert>>() {}))
+        .apply(GroupByKey.create());
+
+PCollection<Alert> throttledAlerts = sessionedAlerts
+        .apply(FlatMapElements.via((KV<Integer, Iterable<Alert>> pair) -> {
+            ArrayList<Alert> acc = new ArrayList<>();
+            FluentIterable
+                .from(pair.getValue())
+                .toSortedList(Comparator.comparing(a -> a.timestamp))
+                .forEach((Alert alert) -> {
+                if (acc.isEmpty() || Iterables.getLast(acc).timestamp.plus(Duration.standardMinutes(60)).isBefore(alert.timestamp)) {
+                    acc.add(alert);
+                }
+                });
+            return acc;
+        }).withOutputType(new TypeDescriptor<Alert>() {}));
+```
+
+We effectively reassign the alerts to a session window and then do a leading debounce manually.
+
+Overall, Beam was a pleasure to work with. The abstractions all make a lot of sense to me. Beam is quite young however, so documentation and general content/examples is very hard to find.
